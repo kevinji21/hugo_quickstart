@@ -92,14 +92,11 @@ async function fetchMeetings(committeeIds) {
   const years = getYearsToFetch();
   const fromDate = getFromDate();
 
-  const fetches = [
-    fetchJSON(`${PRIMEGOV_BASE}/api/v2/PublicPortal/ListUpcomingMeetings`),
-    ...years.map((y) =>
-      fetchJSON(
-        `${PRIMEGOV_BASE}/api/v2/PublicPortal/ListArchivedMeetings?year=${y}`
-      )
-    ),
-  ];
+  const fetches = years.map((y) =>
+    fetchJSON(
+      `${PRIMEGOV_BASE}/api/v2/PublicPortal/ListArchivedMeetings?year=${y}`
+    )
+  );
   const results = await Promise.all(fetches);
   const all = results.flat();
 
@@ -114,11 +111,27 @@ async function fetchMeetings(committeeIds) {
   });
 }
 
-function findHTMLAgendaDocId(meeting) {
-  const htmlDoc = meeting.documentList.find(
-    (d) => d.compileOutputType === 3 && d.templateName === "HTML Agenda"
+function findDocId(meeting, templateName) {
+  const doc = meeting.documentList.find(
+    (d) => d.compileOutputType === 3 && d.templateName === templateName
   );
-  return htmlDoc ? htmlDoc.id : null;
+  return doc ? doc.id : null;
+}
+
+function findHTMLAgendaDocId(meeting) {
+  return findDocId(meeting, "HTML Agenda");
+}
+
+function findMinutesDocId(meeting) {
+  return (
+    findDocId(meeting, "HTML Minutes") ||
+    findDocId(meeting, "HTML Summary") ||
+    findDocId(meeting, "Meeting Summary")
+  );
+}
+
+function meetingDocUrl(docId) {
+  return `${PRIMEGOV_BASE}/Portal/Meeting?compiledMeetingDocumentFileId=${docId}`;
 }
 
 async function fetchAgendaText(docId) {
@@ -201,14 +214,43 @@ function sanitizeTitle(title) {
     .replace(/&gt;/g, ">");
 }
 
-function writePost(slug, meeting, summary) {
+function postHasSummary(slug) {
+  const filePath = path.join(POSTS_DIR, `${slug}.md`);
+  if (!fs.existsSync(filePath)) return false;
+  const content = fs.readFileSync(filePath, "utf-8");
+  return content.includes("## Summary");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function writePost(slug, meeting, summary, links) {
   const title = sanitizeTitle(meeting.title);
   const dateFormatted = formatDate(meeting.dateTime);
   const isoDate = toISOWithTZ(meeting.dateTime);
 
-  const videoLine = meeting.videoUrl
-    ? `- **Meeting video:** [Watch on YouTube](${meeting.videoUrl})`
-    : `- **Meeting video:** [City of Palo Alto YouTube](https://www.youtube.com/@cityofpaloalto)`;
+  const linkLines = [];
+
+  if (links.agendaUrl) {
+    linkLines.push(`- **Agenda:** [View agenda](${links.agendaUrl})`);
+  }
+
+  if (links.videoUrl) {
+    linkLines.push(
+      `- **Meeting video:** [Watch on YouTube](${links.videoUrl})`
+    );
+  } else {
+    linkLines.push(
+      `- **Meeting video:** [City of Palo Alto YouTube](https://www.youtube.com/@cityofpaloalto)`
+    );
+  }
+
+  if (links.minutesUrl) {
+    linkLines.push(
+      `- **Summary notes:** [View meeting notes](${links.minutesUrl})`
+    );
+  }
 
   const content = `+++
 date = '${isoDate}'
@@ -219,9 +261,7 @@ ${summary}
 
 ## Links
 
-${videoLine}
-- **Agenda:** [View agenda](${PRIMEGOV_BASE}/public/portal)
-- **City Clerk:** [Meeting Agendas and Minutes](https://www.paloalto.gov/Departments/City-Clerk/City-Meeting-Groups/Meeting-Agendas-and-Minutes)
+${linkLines.join("\n")}
 `;
 
   const filePath = path.join(POSTS_DIR, `${slug}.md`);
@@ -247,17 +287,16 @@ async function main() {
 
   const existingSlugs = getExistingSlugs();
   let created = 0;
+  let summarized = 0;
+
+  // Phase 1: Create posts for new meetings (no Gemini calls)
+  const needsSummary = [];
 
   for (const meeting of meetings) {
     const committeeName =
       committees[String(meeting.committeeId)] ||
       `committee-${meeting.committeeId}`;
     const slug = postSlug(meeting.dateTime, committeeName);
-
-    if (existingSlugs.has(slug)) {
-      console.log(`  Skipping ${slug} (post already exists)`);
-      continue;
-    }
 
     if (meeting.title.includes("CANCELED")) {
       console.log(`  Skipping ${slug} (meeting canceled)`);
@@ -270,7 +309,20 @@ async function main() {
       continue;
     }
 
-    console.log(`  Processing ${slug}: ${meeting.title}...`);
+    if (existingSlugs.has(slug) && postHasSummary(slug)) {
+      console.log(`  Skipping ${slug} (post with summary already exists)`);
+      continue;
+    }
+
+    const minutesDocId = findMinutesDocId(meeting);
+
+    const links = {
+      agendaUrl: meetingDocUrl(docId),
+      videoUrl: meeting.videoUrl || null,
+      minutesUrl: minutesDocId ? meetingDocUrl(minutesDocId) : null,
+    };
+
+    console.log(`  Fetching agenda for ${slug}: ${meeting.title}...`);
 
     const agendaText = await fetchAgendaText(docId);
     if (!agendaText) {
@@ -278,19 +330,41 @@ async function main() {
       continue;
     }
 
-    console.log(`    Agenda text: ${agendaText.length} chars, summarizing...`);
-    const summary = await summarizeWithAI(
-      agendaText,
-      meeting.title,
-      formatDate(meeting.dateTime)
-    );
+    if (!existingSlugs.has(slug)) {
+      const placeholder = `*Summary pending — agenda has ${agendaText.length} characters.*`;
+      const filePath = writePost(slug, meeting, placeholder, links);
+      console.log(`    Created post (without summary): ${filePath}`);
+      created++;
+    }
 
-    const filePath = writePost(slug, meeting, summary);
-    console.log(`    Created: ${filePath}`);
-    created++;
+    needsSummary.push({ slug, meeting, agendaText, links });
   }
 
-  console.log(`\nDone. Created ${created} new post(s).`);
+  // Phase 2: Generate AI summaries only for posts that need them
+  const DELAY_MS = 2000;
+
+  for (const { slug, meeting, agendaText, links } of needsSummary) {
+    console.log(`  Summarizing ${slug}...`);
+    try {
+      const summary = await summarizeWithAI(
+        agendaText,
+        meeting.title,
+        formatDate(meeting.dateTime)
+      );
+      writePost(slug, meeting, summary, links);
+      console.log(`    Summary written for ${slug}`);
+      summarized++;
+    } catch (err) {
+      console.warn(`    Failed to summarize ${slug}: ${err.message}`);
+      console.warn(`    Post exists with placeholder; will retry next run.`);
+    }
+
+    await sleep(DELAY_MS);
+  }
+
+  console.log(
+    `\nDone. Created ${created} new post(s), summarized ${summarized}.`
+  );
   if (created > 0 && process.env.GITHUB_OUTPUT) {
     fs.appendFileSync(process.env.GITHUB_OUTPUT, "new_posts=true\n");
   }
