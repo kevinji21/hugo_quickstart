@@ -144,11 +144,15 @@ async function fetchAgendaText(docId) {
   return stripHTML(html.substring(bodyStart));
 }
 
+const DEFAULT_MODEL = "gemini-2.0-flash-lite";
+const MAX_RETRIES = 3;
+
 async function summarizeWithAI(agendaText, meetingTitle, meetingDate) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey)
     throw new Error("GEMINI_API_KEY environment variable is not set");
 
+  const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
   const truncated = agendaText.slice(0, 12000);
 
   const prompt = `You are a local government journalist summarizing a Palo Alto city meeting for residents.
@@ -166,26 +170,40 @@ Rules:
 Agenda content:
 ${truncated}`;
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.3,
-        maxOutputTokens: 1000,
-      },
-    }),
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const body = JSON.stringify({
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: 1000,
+    },
   });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Gemini API error: ${res.status} ${err}`);
-  }
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
 
-  const data = await res.json();
-  return data.candidates[0].content.parts[0].text.trim();
+    if (res.ok) {
+      const data = await res.json();
+      return data.candidates[0].content.parts[0].text.trim();
+    }
+
+    const err = await res.text();
+
+    if (res.status === 429 && attempt < MAX_RETRIES) {
+      const backoff = Math.pow(2, attempt) * 5000;
+      console.warn(
+        `    Rate limited (attempt ${attempt}/${MAX_RETRIES}), retrying in ${backoff / 1000}s...`
+      );
+      await sleep(backoff);
+      continue;
+    }
+
+    throw new Error(`Gemini API error (${model}): ${res.status} ${err}`);
+  }
 }
 
 function formatDate(dateStr) {
