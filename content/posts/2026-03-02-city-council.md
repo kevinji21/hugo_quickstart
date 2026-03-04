@@ -3,7 +3,7 @@ date = '2026-03-02T17:30:00-08:00'
 draft = false
 title = 'City Council Regular Meeting – March 2, 2026'
 +++
-*AI summary not available — GEMINI_API_KEY was not configured when this post was generated. Re-run with the API key set to generate a summary.*
+*Summary pending — minutes has 71009 characters.*
 
 ## Links
 
