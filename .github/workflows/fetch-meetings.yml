@@ -1,0 +1,55 @@
+name: Fetch City Council meetings
+on:
+  schedule:
+    # Runs every day at 8:00 AM Pacific (16:00 UTC)
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+    inputs:
+      committees:
+        description: >
+          Which committees to fetch. Use "default" for City Council only,
+          "all" for every committee, or a comma-separated list of IDs
+          (e.g. "9,10,11"). See data/committees.json for all IDs.
+        required: false
+        default: "default"
+      from_date:
+        description: >
+          Fetch meetings from this date onward (YYYY-MM-DD). Useful for
+          backfilling past meetings. Defaults to the current year.
+        required: false
+permissions:
+  contents: write
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Sync committee IDs
+        run: node scripts/sync-committees.js
+      - name: Fetch and summarize new meetings
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          COMMITTEE_IDS: ${{ github.event.inputs.committees || 'default' }}
+          FROM_DATE: ${{ github.event.inputs.from_date || '' }}
+        run: node scripts/fetch-meetings.js
+      - name: Check for changes
+        id: check
+        run: |
+          if [ -n "$(git status --porcelain content/posts/ data/)" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Commit and push changes
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add content/posts/ data/committees.json
+          git commit -m "Add new meeting summaries and update committees"
+          git push

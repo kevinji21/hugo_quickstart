@@ -1,0 +1,7 @@
+{
+  "name": "quickstart",
+  "private": true,
+  "scripts": {
+    "fetch-meetings": "node scripts/fetch-meetings.js"
+  }
+}
