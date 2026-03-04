@@ -446,24 +446,36 @@ async function main() {
 
   const DELAY_MS = 2000;
 
-  for (const { slug, meeting, sourceText, sourceType, links } of needsAISummary) {
-    console.log(`  Summarizing ${slug} from ${sourceType} with AI...`);
-    try {
-      const summary = await summarizeWithAI(
-        sourceText,
-        meeting.title,
-        formatDate(meeting.dateTime),
-        sourceType
-      );
-      writePost(slug, meeting, summary, links);
-      console.log(`    AI summary written for ${slug}`);
-      summarized++;
-    } catch (err) {
-      console.warn(`    Failed to summarize ${slug}: ${err.message}`);
-      console.warn(`    Post exists with placeholder; will retry next run.`);
+  if (!process.env.GEMINI_API_KEY) {
+    console.log(
+      `\nNo GEMINI_API_KEY set — skipping AI summarization for ${needsAISummary.length} meeting(s).`
+    );
+    for (const { slug, meeting, links } of needsAISummary) {
+      if (!postHasSummary(slug)) {
+        const notice = `*AI summary not available — GEMINI_API_KEY was not configured when this post was generated. Re-run with the API key set to generate a summary.*`;
+        writePost(slug, meeting, notice, links);
+      }
     }
+  } else {
+    for (const { slug, meeting, sourceText, sourceType, links } of needsAISummary) {
+      console.log(`  Summarizing ${slug} from ${sourceType} with AI...`);
+      try {
+        const summary = await summarizeWithAI(
+          sourceText,
+          meeting.title,
+          formatDate(meeting.dateTime),
+          sourceType
+        );
+        writePost(slug, meeting, summary, links);
+        console.log(`    AI summary written for ${slug}`);
+        summarized++;
+      } catch (err) {
+        console.warn(`    Failed to summarize ${slug}: ${err.message}`);
+        console.warn(`    Post exists with placeholder; will retry next run.`);
+      }
 
-    await sleep(DELAY_MS);
+      await sleep(DELAY_MS);
+    }
   }
 
   console.log(
