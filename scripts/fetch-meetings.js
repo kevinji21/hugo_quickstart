@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const pdfParse = require("pdf-parse");
 
 const PRIMEGOV_BASE = "https://cityofpaloalto.primegov.com";
 const POSTS_DIR = path.join(__dirname, "..", "content", "posts");
@@ -111,63 +112,79 @@ async function fetchMeetings(committeeIds) {
   });
 }
 
-function findDocId(meeting, templateName) {
-  const doc = meeting.documentList.find(
-    (d) => d.compileOutputType === 3 && d.templateName === templateName
-  );
-  return doc ? doc.id : null;
-}
-
-function findHTMLAgendaDocId(meeting) {
-  return findDocId(meeting, "HTML Agenda");
-}
-
-function findMinutesDocId(meeting) {
+function findDoc(meeting, templateName, outputType) {
   return (
-    findDocId(meeting, "HTML Minutes") ||
-    findDocId(meeting, "HTML Summary") ||
-    findDocId(meeting, "Meeting Summary")
+    meeting.documentList.find(
+      (d) => d.templateName === templateName && d.compileOutputType === outputType
+    ) || null
   );
 }
 
-function meetingDocUrl(docId) {
+function htmlDocUrl(docId) {
   return `${PRIMEGOV_BASE}/Portal/Meeting?compiledMeetingDocumentFileId=${docId}`;
 }
 
-async function fetchDocText(docId) {
-  const url = meetingDocUrl(docId);
-  const html = await fetchHTML(url);
+function pdfDocUrl(templateId) {
+  return `${PRIMEGOV_BASE}/Public/CompiledDocument?meetingTemplateId=${templateId}&compileOutputType=1`;
+}
 
+function pdfViewerUrl(docId) {
+  return `${PRIMEGOV_BASE}/viewer/preview?id=${docId}&type=1`;
+}
+
+async function fetchHTMLDocText(docId) {
+  const url = htmlDocUrl(docId);
+  const html = await fetchHTML(url);
   const bodyStart = html.indexOf("<body");
   if (bodyStart === -1) return null;
-
   return stripHTML(html.substring(bodyStart));
+}
+
+async function fetchPDFText(templateId) {
+  const url = pdfDocUrl(templateId);
+  const res = await fetch(url, { redirect: "follow" });
+  if (!res.ok) return null;
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const pdf = await pdfParse(buffer);
+  return pdf.text.trim();
 }
 
 const DEFAULT_MODEL = "gemini-2.0-flash-lite";
 const MAX_RETRIES = 3;
 
-async function summarizeWithAI(agendaText, meetingTitle, meetingDate) {
+async function summarizeWithAI(sourceText, meetingTitle, meetingDate, sourceType) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey)
     throw new Error("GEMINI_API_KEY environment variable is not set");
 
   const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
-  const truncated = agendaText.slice(0, 12000);
+  const truncated = sourceText.slice(0, 12000);
+
+  const sourceLabel =
+    sourceType === "minutes"
+      ? "meeting minutes"
+      : sourceType === "action-minutes"
+        ? "action minutes"
+        : "agenda";
+
+  const actionMinutesNote =
+    sourceType === "action-minutes"
+      ? `\n- Begin the summary with a note: "*This summary is based on action minutes. Full summary minutes were not available for this meeting.*"\n`
+      : "";
 
   const prompt = `You are a local government journalist summarizing a Palo Alto city meeting for residents.
 
-Given the following agenda for "${meetingTitle}" on ${meetingDate}, write a blog post summary.
+Given the following ${sourceLabel} for "${meetingTitle}" on ${meetingDate}, write a blog post summary.
 
 Rules:
 - Start with a "## Summary" section: a brief paragraph describing the meeting, then bullet points of key actions/decisions/discussion items.
-- Then a "## Agenda Highlights" section with short descriptions of notable agenda items.
+- Then a "## Agenda Highlights" section: for each agenda item, give a short plain-language description of what was discussed or decided.
 - Use plain, accessible language. No jargon.
 - Be factual and neutral.
 - Do NOT include links, frontmatter, or a title.
-- Keep it concise (200-400 words).
+- Keep it concise (300-500 words).${actionMinutesNote}
 
-Agenda content:
+${sourceLabel} content:
 ${truncated}`;
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
@@ -243,6 +260,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function docUrl(doc) {
+  if (doc.compileOutputType === 3) {
+    return htmlDocUrl(doc.id);
+  }
+  return pdfViewerUrl(doc.id);
+}
+
 function writePost(slug, meeting, summary, links) {
   if (!fs.existsSync(POSTS_DIR)) {
     fs.mkdirSync(POSTS_DIR, { recursive: true });
@@ -269,9 +293,33 @@ function writePost(slug, meeting, summary, links) {
 
   if (links.minutesUrl) {
     linkLines.push(
-      `- **Summary notes:** [View meeting notes](${links.minutesUrl})`
+      `- **Summary minutes:** [View meeting notes](${links.minutesUrl})`
     );
   }
+
+  if (links.actionMinutesUrl) {
+    linkLines.push(
+      `- **Action minutes:** [View action minutes](${links.actionMinutesUrl})`
+    );
+  }
+
+  if (links.packetUrl) {
+    linkLines.push(`- **Packet:** [View packet](${links.packetUrl})`);
+  }
+
+  const allDocsLines = [];
+  if (meeting.documentList && meeting.documentList.length > 0) {
+    for (const doc of meeting.documentList) {
+      const url = docUrl(doc);
+      const format = doc.compileOutputType === 3 ? "HTML" : "PDF";
+      allDocsLines.push(`- [${doc.templateName}](${url}) (${format})`);
+    }
+  }
+
+  const allDocsSection =
+    allDocsLines.length > 0
+      ? `\n\n## All Documents\n\n${allDocsLines.join("\n")}\n`
+      : "";
 
   const content = `+++
 date = '${isoDate}'
@@ -283,7 +331,7 @@ ${summary}
 ## Links
 
 ${linkLines.join("\n")}
-`;
+${allDocsSection}`;
 
   const filePath = path.join(POSTS_DIR, `${slug}.md`);
   fs.writeFileSync(filePath, content, "utf-8");
@@ -322,67 +370,90 @@ async function main() {
       continue;
     }
 
-    const docId = findHTMLAgendaDocId(meeting);
-    if (!docId) {
-      console.log(`  Skipping ${slug} (no HTML agenda available yet)`);
-      continue;
-    }
-
     if (existingSlugs.has(slug) && postHasSummary(slug)) {
       console.log(`  Skipping ${slug} (post with summary already exists)`);
       continue;
     }
 
-    const minutesDocId = findMinutesDocId(meeting);
+    const agendaDoc = findDoc(meeting, "HTML Agenda", 3);
+    const minutesDoc = findDoc(meeting, "Summary Minutes", 1);
+    const actionMinutesDoc = findDoc(meeting, "Action Minutes", 1);
+    const packetDoc = findDoc(meeting, "Packet", 1);
 
-    const links = {
-      agendaUrl: meetingDocUrl(docId),
-      videoUrl: meeting.videoUrl || null,
-      minutesUrl: minutesDocId ? meetingDocUrl(minutesDocId) : null,
-    };
-
-    // If official minutes exist, use them directly (no Gemini needed)
-    if (minutesDocId) {
-      console.log(`  Fetching minutes for ${slug}: ${meeting.title}...`);
-      const minutesText = await fetchDocText(minutesDocId);
-      if (minutesText) {
-        const summary = `## Summary\n\n${minutesText}`;
-        const filePath = writePost(slug, meeting, summary, links);
-        console.log(`    Created post from official minutes: ${filePath}`);
-        created++;
-        continue;
-      }
-      console.log(`    Could not extract minutes text, falling back to agenda`);
+    if (!agendaDoc) {
+      console.log(`  Skipping ${slug} (no HTML agenda available yet)`);
+      continue;
     }
 
-    // No minutes — will need Gemini to summarize the agenda
-    console.log(`  Fetching agenda for ${slug}: ${meeting.title}...`);
-    const agendaText = await fetchDocText(docId);
-    if (!agendaText) {
-      console.log(`    Could not extract agenda text, skipping`);
+    const links = {
+      agendaUrl: htmlDocUrl(agendaDoc.id),
+      videoUrl: meeting.videoUrl || null,
+      minutesUrl: minutesDoc ? pdfViewerUrl(minutesDoc.id) : null,
+      actionMinutesUrl: actionMinutesDoc ? pdfViewerUrl(actionMinutesDoc.id) : null,
+      packetUrl: packetDoc ? pdfViewerUrl(packetDoc.id) : null,
+    };
+
+    // Prefer summary minutes, then action minutes, then HTML agenda
+    let sourceText = null;
+    let sourceType = null;
+
+    if (minutesDoc) {
+      console.log(`  Fetching summary minutes PDF for ${slug}: ${meeting.title}...`);
+      try {
+        sourceText = await fetchPDFText(minutesDoc.templateId);
+        sourceType = "minutes";
+        if (sourceText) {
+          console.log(`    Summary minutes text: ${sourceText.length} chars`);
+        }
+      } catch (err) {
+        console.warn(`    Could not extract summary minutes PDF: ${err.message}`);
+      }
+    }
+
+    if (!sourceText && actionMinutesDoc) {
+      console.log(`  Fetching action minutes PDF for ${slug}: ${meeting.title}...`);
+      try {
+        sourceText = await fetchPDFText(actionMinutesDoc.templateId);
+        sourceType = "action-minutes";
+        if (sourceText) {
+          console.log(`    Action minutes text: ${sourceText.length} chars`);
+        }
+      } catch (err) {
+        console.warn(`    Could not extract action minutes PDF: ${err.message}`);
+      }
+    }
+
+    if (!sourceText) {
+      console.log(`  Fetching HTML agenda for ${slug}: ${meeting.title}...`);
+      sourceText = await fetchHTMLDocText(agendaDoc.id);
+      sourceType = "agenda";
+    }
+
+    if (!sourceText) {
+      console.log(`    Could not extract any document text, skipping`);
       continue;
     }
 
     if (!existingSlugs.has(slug)) {
-      const placeholder = `*Summary pending — agenda has ${agendaText.length} characters.*`;
+      const placeholder = `*Summary pending — ${sourceType} has ${sourceText.length} characters.*`;
       writePost(slug, meeting, placeholder, links);
       console.log(`    Created placeholder post: ${slug}`);
       created++;
     }
 
-    needsAISummary.push({ slug, meeting, agendaText, links });
+    needsAISummary.push({ slug, meeting, sourceText, sourceType, links });
   }
 
-  // Generate AI summaries only for posts without official minutes
   const DELAY_MS = 2000;
 
-  for (const { slug, meeting, agendaText, links } of needsAISummary) {
-    console.log(`  Summarizing ${slug} with AI...`);
+  for (const { slug, meeting, sourceText, sourceType, links } of needsAISummary) {
+    console.log(`  Summarizing ${slug} from ${sourceType} with AI...`);
     try {
       const summary = await summarizeWithAI(
-        agendaText,
+        sourceText,
         meeting.title,
-        formatDate(meeting.dateTime)
+        formatDate(meeting.dateTime),
+        sourceType
       );
       writePost(slug, meeting, summary, links);
       console.log(`    AI summary written for ${slug}`);

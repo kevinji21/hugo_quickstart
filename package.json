@@ -3,5 +3,8 @@
   "private": true,
   "scripts": {
     "fetch-meetings": "node scripts/fetch-meetings.js"
+  },
+  "dependencies": {
+    "pdf-parse": "^1.1.1"
   }
 }
