@@ -244,7 +244,9 @@ function sleep(ms) {
 }
 
 function writePost(slug, meeting, summary, links) {
-  fs.mkdirSync(POSTS_DIR, { recursive: true });
+  if (!fs.existsSync(POSTS_DIR)) {
+    fs.mkdirSync(POSTS_DIR, { recursive: true });
+  }
   const title = sanitizeTitle(meeting.title);
   const dateFormatted = formatDate(meeting.dateTime);
   const isoDate = toISOWithTZ(meeting.dateTime);
