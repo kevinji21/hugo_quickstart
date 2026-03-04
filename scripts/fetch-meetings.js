@@ -277,10 +277,6 @@ function writePost(slug, meeting, summary, links) {
 
   const linkLines = [];
 
-  if (links.agendaUrl) {
-    linkLines.push(`- **Agenda:** [View agenda](${links.agendaUrl})`);
-  }
-
   if (links.videoUrl) {
     linkLines.push(
       `- **Meeting video:** [Watch on YouTube](${links.videoUrl})`
@@ -291,35 +287,13 @@ function writePost(slug, meeting, summary, links) {
     );
   }
 
-  if (links.minutesUrl) {
-    linkLines.push(
-      `- **Summary minutes:** [View meeting notes](${links.minutesUrl})`
-    );
-  }
-
-  if (links.actionMinutesUrl) {
-    linkLines.push(
-      `- **Action minutes:** [View action minutes](${links.actionMinutesUrl})`
-    );
-  }
-
-  if (links.packetUrl) {
-    linkLines.push(`- **Packet:** [View packet](${links.packetUrl})`);
-  }
-
-  const allDocsLines = [];
   if (meeting.documentList && meeting.documentList.length > 0) {
     for (const doc of meeting.documentList) {
       const url = docUrl(doc);
       const format = doc.compileOutputType === 3 ? "HTML" : "PDF";
-      allDocsLines.push(`- [${doc.templateName}](${url}) (${format})`);
+      linkLines.push(`- **${doc.templateName}:** [View ${doc.templateName.toLowerCase()}](${url}) (${format})`);
     }
   }
-
-  const allDocsSection =
-    allDocsLines.length > 0
-      ? `\n\n## All Documents\n\n${allDocsLines.join("\n")}\n`
-      : "";
 
   const content = `+++
 date = '${isoDate}'
@@ -331,7 +305,7 @@ ${summary}
 ## Links
 
 ${linkLines.join("\n")}
-${allDocsSection}`;
+`;
 
   const filePath = path.join(POSTS_DIR, `${slug}.md`);
   fs.writeFileSync(filePath, content, "utf-8");
@@ -386,11 +360,7 @@ async function main() {
     }
 
     const links = {
-      agendaUrl: htmlDocUrl(agendaDoc.id),
       videoUrl: meeting.videoUrl || null,
-      minutesUrl: minutesDoc ? pdfViewerUrl(minutesDoc.id) : null,
-      actionMinutesUrl: actionMinutesDoc ? pdfViewerUrl(actionMinutesDoc.id) : null,
-      packetUrl: packetDoc ? pdfViewerUrl(packetDoc.id) : null,
     };
 
     // Prefer summary minutes, then action minutes, then HTML agenda
