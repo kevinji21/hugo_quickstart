@@ -149,7 +149,7 @@ async function fetchPDFText(templateId) {
   return pdf.text.trim();
 }
 
-const DEFAULT_MODEL = "gemini-2.0-flash-lite";
+const DEFAULT_MODEL = "gemini-2.5-flash";
 const MAX_RETRIES = 3;
 
 async function summarizeWithAI(sourceText, meetingTitle, meetingDate, sourceType) {
@@ -191,8 +191,8 @@ ${truncated}`;
   const body = JSON.stringify({
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: {
-      temperature: 0.3,
-      maxOutputTokens: 1000,
+      temperature: 0.2,
+      maxOutputTokens: 4096,
     },
   });
 
