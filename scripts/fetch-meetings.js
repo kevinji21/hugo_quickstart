@@ -134,8 +134,8 @@ function meetingDocUrl(docId) {
   return `${PRIMEGOV_BASE}/Portal/Meeting?compiledMeetingDocumentFileId=${docId}`;
 }
 
-async function fetchAgendaText(docId) {
-  const url = `${PRIMEGOV_BASE}/Portal/Meeting?compiledMeetingDocumentFileId=${docId}`;
+async function fetchDocText(docId) {
+  const url = meetingDocUrl(docId);
   const html = await fetchHTML(url);
 
   const bodyStart = html.indexOf("<body");
@@ -306,9 +306,7 @@ async function main() {
   const existingSlugs = getExistingSlugs();
   let created = 0;
   let summarized = 0;
-
-  // Phase 1: Create posts for new meetings (no Gemini calls)
-  const needsSummary = [];
+  const needsAISummary = [];
 
   for (const meeting of meetings) {
     const committeeName =
@@ -340,9 +338,23 @@ async function main() {
       minutesUrl: minutesDocId ? meetingDocUrl(minutesDocId) : null,
     };
 
-    console.log(`  Fetching agenda for ${slug}: ${meeting.title}...`);
+    // If official minutes exist, use them directly (no Gemini needed)
+    if (minutesDocId) {
+      console.log(`  Fetching minutes for ${slug}: ${meeting.title}...`);
+      const minutesText = await fetchDocText(minutesDocId);
+      if (minutesText) {
+        const summary = `## Summary\n\n${minutesText}`;
+        const filePath = writePost(slug, meeting, summary, links);
+        console.log(`    Created post from official minutes: ${filePath}`);
+        created++;
+        continue;
+      }
+      console.log(`    Could not extract minutes text, falling back to agenda`);
+    }
 
-    const agendaText = await fetchAgendaText(docId);
+    // No minutes — will need Gemini to summarize the agenda
+    console.log(`  Fetching agenda for ${slug}: ${meeting.title}...`);
+    const agendaText = await fetchDocText(docId);
     if (!agendaText) {
       console.log(`    Could not extract agenda text, skipping`);
       continue;
@@ -350,19 +362,19 @@ async function main() {
 
     if (!existingSlugs.has(slug)) {
       const placeholder = `*Summary pending — agenda has ${agendaText.length} characters.*`;
-      const filePath = writePost(slug, meeting, placeholder, links);
-      console.log(`    Created post (without summary): ${filePath}`);
+      writePost(slug, meeting, placeholder, links);
+      console.log(`    Created placeholder post: ${slug}`);
       created++;
     }
 
-    needsSummary.push({ slug, meeting, agendaText, links });
+    needsAISummary.push({ slug, meeting, agendaText, links });
   }
 
-  // Phase 2: Generate AI summaries only for posts that need them
+  // Generate AI summaries only for posts without official minutes
   const DELAY_MS = 2000;
 
-  for (const { slug, meeting, agendaText, links } of needsSummary) {
-    console.log(`  Summarizing ${slug}...`);
+  for (const { slug, meeting, agendaText, links } of needsAISummary) {
+    console.log(`  Summarizing ${slug} with AI...`);
     try {
       const summary = await summarizeWithAI(
         agendaText,
@@ -370,7 +382,7 @@ async function main() {
         formatDate(meeting.dateTime)
       );
       writePost(slug, meeting, summary, links);
-      console.log(`    Summary written for ${slug}`);
+      console.log(`    AI summary written for ${slug}`);
       summarized++;
     } catch (err) {
       console.warn(`    Failed to summarize ${slug}: ${err.message}`);
@@ -381,7 +393,7 @@ async function main() {
   }
 
   console.log(
-    `\nDone. Created ${created} new post(s), summarized ${summarized}.`
+    `\nDone. Created ${created} new post(s), AI-summarized ${summarized}.`
   );
   if (created > 0 && process.env.GITHUB_OUTPUT) {
     fs.appendFileSync(process.env.GITHUB_OUTPUT, "new_posts=true\n");
